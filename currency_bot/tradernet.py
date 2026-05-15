@@ -8,41 +8,38 @@ logger = logging.getLogger(__name__)
 
 class TradernetClient:
     def __init__(self, api_key: str, secret_key: str):
-        # Ключи оставляем для инициализации, но для данного метода они не требуются,
-        # так как курсы валют — это открытые данные, доступные по GET-запросу
         self.api_key = api_key
         self.secret_key = secret_key
-        # Базовый URL согласно документации для GET-запросов
         self.base_url = "https://tradernet.global/api/"
 
-    async def get_rates_with_prev(self, pairs: list) -> dict:
+    async def get_rates(self, pairs_days: dict) -> dict:
         """
-        На вход: ["USD/KZT", "EUR/KZT"]
-        На выход: {"USD/KZT": {"current": 450.5, "prev": 448.2}, ...}
+        pairs_days: {"USD/KZT": {1, 2}, "EUR/USD": {1, 5}} (тикер -> множество нужных дней)
+        Возвращает: {"USD/KZT": {"current": 450, "history": {1: 445, 2: 440}}}
         """
-        if not pairs:
+        if not pairs_days:
             return {}
 
-        requests_by_base = {}
-        for pair in pairs:
+        # Группируем запросы: {(base_currency, days_ago): set(target_currencies)}
+        queries = {}
+        for pair, days_set in pairs_days.items():
             if "/" not in pair:
                 continue
             base, target = pair.split("/")
             base, target = base.upper(), target.upper()
-            if base not in requests_by_base:
-                requests_by_base[base] = set()
-            requests_by_base[base].add(target)
 
-        result = {}
-        # Получаем вчерашнюю дату
-        yesterday_str = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+            # Обязательно запрашиваем текущий курс (days = 0)
+            queries.setdefault((base, 0), set()).add(target)
+            for d in days_set:
+                queries.setdefault((base, d), set()).add(target)
+
+        result = {pair: {"current": None, "history": {}} for pair in pairs_days}
+        today = datetime.datetime.now()
 
         async with aiohttp.ClientSession() as session:
-            for base, targets in requests_by_base.items():
+            for (base, days), targets in queries.items():
                 targets_list = list(targets)
-
-                # Запрос 1: Текущие курсы (сегодня)
-                payload_curr = {
+                payload = {
                     "cmd": "getCrossRatesForDate",
                     "params": {
                         "base_currency": base,
@@ -50,46 +47,35 @@ class TradernetClient:
                     }
                 }
 
-                # Запрос 2: Вчерашние курсы
-                payload_prev = {
-                    "cmd": "getCrossRatesForDate",
-                    "params": {
-                        "base_currency": base,
-                        "currencies": targets_list,
-                        "date": yesterday_str
-                    }
-                }
+                # Если запрашиваем историю, добавляем дату
+                if days > 0:
+                    date_str = (today - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
+                    payload["params"]["date"] = date_str
 
-                async def fetch(payload):
-                    # Отправляем GET-запрос с параметром q={json_string}
-                    params = {"q": json.dumps(payload)}
-                    try:
-                        async with session.get(self.base_url, params=params) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                # Если от API пришла ошибка в JSON
-                                if "errMsg" in data:
-                                    logger.error(f"Ошибка API: {data['errMsg']} | Payload: {payload}")
-                                    return {}
-                                return data.get("rates", {})
-                            else:
-                                logger.error(f"HTTP Ошибка {resp.status} | Payload: {payload}")
-                                return {}
-                    except Exception as e:
-                        logger.error(f"Сетевая ошибка: {e}")
-                        return {}
+                params = {"q": json.dumps(payload)}
+                try:
+                    async with session.get(self.base_url, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            rates = data.get("rates", {})
+                            for t in targets_list:
+                                pair_name = f"{base}/{t}"
+                                val = rates.get(t)
+                                if val is not None and pair_name in result:
+                                    if days == 0:
+                                        result[pair_name]["current"] = float(val)
+                                    else:
+                                        result[pair_name]["history"][days] = float(val)
+                except Exception as e:
+                    logger.error(f"Ошибка API Tradernet: {e}")
 
-                # Делаем асинхронные запросы
-                curr_rates = await fetch(payload_curr)
-                prev_rates = await fetch(payload_prev)
-
-                for target in targets_list:
-                    pair_name = f"{base}/{target}"
-                    if target in curr_rates:
-                        result[pair_name] = {
-                            "current": float(curr_rates[target]),
-                            # Если вчерашнего курса нет (выходной), страхуемся и ставим текущий
-                            "prev": float(prev_rates.get(target, curr_rates[target]))
-                        }
+        # Защита от выходных: если исторической даты нет, страхуемся текущим курсом
+        for pair, data in result.items():
+            curr = data["current"]
+            if curr is None:
+                continue
+            for d in pairs_days.get(pair, []):
+                if d not in data["history"]:
+                    data["history"][d] = curr
 
         return result
