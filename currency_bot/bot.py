@@ -19,6 +19,7 @@ dp = Dispatcher()
 storage = Storage(STORAGE_FILE)
 api_client = TradernetClient(TRADERNET_API_KEY, TRADERNET_SECRET_KEY)
 
+# Хранит цену, при которой было отправлено последнее уведомление (для антиспама)
 last_alert_prices = {}
 
 
@@ -31,8 +32,8 @@ async def cmd_start(message: types.Message):
         "/remove [Пара] [Направление (опц.)] — удалить правило\n"
         "/list — ваши отслеживания\n\n"
         "<b>Примеры:</b>\n"
-        "<code>/add USD/KZT 1.5 both</code> (изменение на 1.5% за 1 день)\n"
-        "<code>/add EUR/USD 4.0 up 3</code> (рост на 4% за 3 дня)"
+        "<code>/add USD/KZT 1.5 both</code> (изменение на 1.5% внутри 1 дня)\n"
+        "<code>/add EUR/USD 4.0 up 3</code> (рост на 4% от любой цены за последние 3 дня)"
     )
 
 
@@ -52,7 +53,6 @@ async def cmd_add(message: types.Message):
 
     try:
         threshold = float(args[1])
-        # Если период не указан, берем 1 день
         days = int(args[3]) if len(args) == 4 else 1
     except ValueError:
         await message.answer("Порог и период должны быть числами.")
@@ -99,12 +99,9 @@ async def cmd_list(message: types.Message):
         await message.answer("Вы ничего не отслеживаете.")
         return
 
-    # Собираем данные для запроса: какие тикеры и за сколько дней нужны
-    pairs_days = {}
-    for ticker, rules in user_data.items():
-        pairs_days[ticker] = {r.get("days", 1) for r in rules.values() if isinstance(r, dict)}
-
-    rates = await api_client.get_rates(pairs_days)
+    # Для команды list запрашиваем только сегодняшний курс (max_days = 0)
+    pairs_max_days = {ticker: 0 for ticker in user_data.keys()}
+    rates = await api_client.get_rates_range(pairs_max_days)
 
     text = "📊 <b>Ваши отслеживания:</b>\n\n"
     for ticker, rules in user_data.items():
@@ -115,7 +112,7 @@ async def cmd_list(message: types.Message):
         text += f"🔹 <b>{ticker}</b> (Текущий курс: <b>{current_price}</b>)\n"
         for direction, rule in rules.items():
             if not isinstance(rule, dict): continue
-            text += f"   └ {direction.upper()}: {rule['threshold']}% (за {rule['days']} дн.)\n"
+            text += f"   └ {direction.upper()}: {rule['threshold']}% (окно {rule['days']} дн.)\n"
         text += "\n"
 
     await message.answer(text)
@@ -134,21 +131,22 @@ async def monitor_task():
                 last_alert_prices.clear()
                 current_day = new_day
 
-            # Собираем нужные периоды со всех пользователей
-            pairs_days = {}
+            # Вычисляем максимальную глубину истории для каждого тикера по всем юзерам
+            pairs_max_days = {}
             for uid, user_config in storage.data.items():
                 for ticker, rules in user_config.items():
-                    if ticker not in pairs_days:
-                        pairs_days[ticker] = set()
+                    if ticker not in pairs_max_days:
+                        pairs_max_days[ticker] = 0
                     for rule in rules.values():
                         if isinstance(rule, dict):
-                            pairs_days[ticker].add(rule["days"])
+                            pairs_max_days[ticker] = max(pairs_max_days[ticker], rule["days"])
 
-            if not pairs_days:
+            if not pairs_max_days:
                 await asyncio.sleep(60)
                 continue
 
-            rates = await api_client.get_rates(pairs_days)
+            # Запрашиваем весь спектр данных
+            rates = await api_client.get_rates_range(pairs_max_days)
 
             for uid_str, user_config in storage.data.items():
                 user_id = int(uid_str)
@@ -171,38 +169,53 @@ async def monitor_task():
                         threshold = rule["threshold"]
                         days = rule["days"]
 
-                        # Историческая цена за нужный период
-                        history_price = rates[ticker]['history'].get(days)
-                        if not history_price:
-                            continue
-
-                        # Берем цену прошлого алерта (антиспам) либо историческую
-                        baseline_price = last_alert_prices[uid_str][ticker].get(direction, history_price)
-                        if baseline_price == 0:
-                            continue
-
-                        diff_pct = ((curr_price - baseline_price) / baseline_price) * 100
+                        # Если по этому правилу уже было уведомление сегодня, сравниваем ТОЛЬКО с ценой прошлого алерта
+                        baseline_price = last_alert_prices[uid_str][ticker].get(direction)
 
                         trigger = False
-                        if direction == 'up' and diff_pct >= threshold:
-                            trigger = True
-                        elif direction == 'down' and diff_pct <= -threshold:
-                            trigger = True
-                        elif direction == 'both' and abs(diff_pct) >= threshold:
-                            trigger = True
+                        best_diff = 0
+                        trigger_h = None
+
+                        if baseline_price:
+                            # Проверяем отклонение от цены последнего уведомления
+                            diff_pct = ((curr_price - baseline_price) / baseline_price) * 100
+                            if direction == 'up' and diff_pct >= threshold:
+                                trigger = True; best_diff = diff_pct; trigger_h = baseline_price
+                            elif direction == 'down' and diff_pct <= -threshold:
+                                trigger = True; best_diff = diff_pct; trigger_h = baseline_price
+                            elif direction == 'both' and abs(diff_pct) >= threshold:
+                                trigger = True; best_diff = diff_pct; trigger_h = baseline_price
+                        else:
+                            # Ищем максимальное отклонение среди всей истории за период (от 1 до days дней назад)
+                            hist_prices = [rates[ticker]['history'][d] for d in range(1, days + 1) if
+                                           d in rates[ticker]['history']]
+                            for h in hist_prices:
+                                diff_pct = ((curr_price - h) / h) * 100
+                                if direction == 'up' and diff_pct >= threshold:
+                                    if diff_pct > best_diff: best_diff = diff_pct; trigger_h = h; trigger = True
+                                elif direction == 'down' and diff_pct <= -threshold:
+                                    if diff_pct < best_diff: best_diff = diff_pct; trigger_h = h; trigger = True
+                                elif direction == 'both' and abs(diff_pct) >= threshold:
+                                    if abs(diff_pct) > abs(
+                                            best_diff): best_diff = diff_pct; trigger_h = h; trigger = True
 
                         if trigger:
-                            sign = "+" if diff_pct > 0 else ""
+                            sign = "+" if best_diff > 0 else ""
+                            context_str = "с базовой цены" if baseline_price else "внутри периода"
+
                             triggered.append(
-                                f"<b>{direction.upper()}</b>: {sign}{diff_pct:.2f}% (порог {threshold}% за {days} дн.)")
-                            # Сохраняем цену алерта для антиспама
+                                f"<b>{direction.upper()}</b>: {sign}{best_diff:.2f}% "
+                                f"(с {trigger_h} до {curr_price})\n"
+                                f"└ <i>Правило: {threshold}% за {days} дн. ({context_str})</i>"
+                            )
+                            # Сохраняем новую цену алерта для антиспама
                             last_alert_prices[uid_str][ticker][direction] = curr_price
 
                     if triggered:
                         msg = (
-                                f"<b>Сработало правило по {ticker}!</b>\n\n"
-                                + "\n".join(triggered) + "\n\n"
-                                                         f"Текущая цена: <b>{curr_price}</b>"
+                                f"🚨 <b>Резкий скачок по {ticker}!</b>\n\n"
+                                + "\n\n".join(triggered) + "\n\n"
+                                                           f"Текущая цена: <b>{curr_price}</b>"
                         )
                         await bot.send_message(user_id, msg)
 
